@@ -1,0 +1,96 @@
+module Examples.OrderService;
+
+target cpp {
+    toolchain: cmake;
+    standard: "c++20";
+    namespace: "examples::order";
+}
+
+target java {
+    toolchain: maven;
+    jdk: 21;
+    package: "com.examples.order";
+}
+
+artifact prd "PRD-ORD-001" {
+    feature: "Stateful Order Lifecycle & Timeout Controls";
+    acceptance: "Orders must follow state machine Created -> Processing -> Fulfilled";
+    constraints: [
+        "Direct transition from Created to Fulfilled is prohibited",
+        "Balance deduction postcondition verifies exact difference against pre-call old() value",
+        "Timeout checks must enforce sub-500ms latency"
+    ];
+}
+
+artifact adr "ADR-0042" {
+    title: "Explicit State Machine & Dimensioned Unit Guards";
+    status: "Accepted";
+    latency_budget: "< 500ms";
+}
+
+contract OrderService {
+    traces: [PRD-ORD-001, ADR-0042];
+
+    enum OrderState {
+        Created,
+        Processing,
+        Fulfilled,
+        Cancelled
+    };
+
+    state machine OrderLifecycle {
+        initial: Created;
+        transitions: [
+            Created -> Processing,
+            Processing -> Fulfilled,
+            Processing -> Cancelled,
+            Created -> Cancelled
+        ];
+    }
+
+    fn fulfillOrder(orderId: string, currentBalance: u32) -> u32 {
+        traces: [PRD-ORD-001.FULFILL];
+        transition: Processing -> Fulfilled;
+        pre: orderId.len() > 0;
+        pre: currentBalance >= 10;
+        post: result == old(currentBalance) - 10;
+        post: currentBalance >= 0;
+    }
+
+    fn checkTimeout(elapsed: u64) -> bool {
+        traces: [ADR-0042.TIMEOUT];
+        pre: elapsed < 500ms;
+        post: result == true;
+    }
+}
+
+agent implementation for OrderService {
+    intent: "Implement strict stateful order processing with transition guards and temporal balance invariant checks.";
+    
+    invariants: [
+        "State transitions must follow OrderLifecycle strictly",
+        "Balance deduction must match exact delta between pre-execution snapshot and result",
+        "Deterministic numerical consistency between C++20 and Java 21"
+    ];
+
+    harness: tdd {
+        coverage_minimum: "90%";
+        property_tests: "true";
+    };
+}
+
+lifecycle sdlc {
+    verify: [unit_tests, state_transition_audit];
+    benchmark: {
+        latency_p99: "< 500ms";
+    };
+    package: docker {
+        base: "alpine";
+        tag: "1.0.0";
+    };
+    deploy: k8s {
+        namespace: "orders";
+        replicas: "2";
+        port: "8080";
+    };
+}

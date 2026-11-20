@@ -1,0 +1,6 @@
+.git
+.agentc/
+build/
+build-make/
+__pycache__/
+*.pyc

@@ -1,0 +1,97 @@
+module Examples.MathService;
+
+import std.math;
+import std.collections;
+
+target cpp {
+    toolchain: cmake;
+    standard: "c++20";
+    namespace: "examples::math";
+}
+
+target java {
+    toolchain: maven;
+    jdk: 21;
+    package: "com.examples.math";
+}
+
+// Artifact Lineage (PRD / ADR / HLD / LLD)
+artifact prd "PRD-MATH-001" {
+    feature: "High-Performance Numerical Operations";
+    acceptance: "Zero division throws exception; Factorial bounded at n<=20";
+    constraints: [
+        "Divide by zero must throw std::invalid_argument or IllegalArgumentException",
+        "Deterministic numerical consistency between C++20 and Java 21"
+    ];
+}
+
+artifact adr "ADR-0014" {
+    title: "C++20 Zero-Cost Arithmetic Abstractions & Java 21 Records";
+    latency_budget: "< 1ms";
+    memory_limit: "< 16MB";
+    optimization: "O2_with_vectorization";
+}
+
+artifact hld "HLD-CORE-MATH" {
+    module: "CoreArithmeticEngine";
+    boundary: "Pure stateless computational primitives";
+}
+
+artifact lld "LLD-ALU-OPS" {
+    precision: "f64 IEEE-754";
+    overflow_guard: "pre-condition bounded checks";
+}
+
+contract MathOperations {
+    type Float = f64;
+    type Integer = i64;
+
+    fn add(a: i64, b: i64) -> i64 {
+        post: result == a + b;
+    }
+
+    fn divide(numerator: f64, denominator: f64) -> f64 {
+        pre: denominator != 0;
+        post: result * denominator == numerator;
+    }
+
+    fn clamp(value: i64, min_val: i64, max_val: i64) -> i64 {
+        pre: min_val <= max_val;
+        post: result >= min_val and result <= max_val;
+    }
+
+    fn factorial(n: u32) -> u64 {
+        pre: n <= 20;
+    }
+}
+
+agent implementation for MathOperations {
+    intent: "Implement highly optimized, mathematically robust arithmetic operations with overflow protection and branchless clamping where possible.";
+    
+    invariants: [
+        "Divide by zero must throw an explicit invalid argument exception",
+        "Factorial must handle n=0 and n=1 returning 1, and prevent integer overflow for n > 20",
+        "Deterministic numerical consistency between C++ and Java"
+    ];
+
+    harness: tdd {
+        coverage_minimum: "90%";
+        property_tests: "true";
+    };
+}
+
+lifecycle sdlc {
+    verify: [unit_tests, boundary_check];
+    benchmark: {
+        latency_p99: "< 1ms";
+    };
+    package: docker {
+        base: "alpine";
+        tag: "1.0.0";
+    };
+    deploy: k8s {
+        namespace: "math";
+        replicas: "2";
+        port: "8080";
+    };
+}

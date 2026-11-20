@@ -1,0 +1,21 @@
+# Compiler build artifacts
+build/
+build-make/
+.agentc/
+bin/agentc-parser
+
+# Object files & archives
+*.o
+*.a
+*.so
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# OS and editor files
+.DS_Store
+*.swp
+*.swo
