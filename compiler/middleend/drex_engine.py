@@ -11,6 +11,7 @@ import math
 import time
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
+from compiler.backend.node_emitter import NODE_TARGETS
 
 @dataclass
 class CompilerState:
@@ -145,8 +146,9 @@ class DrexDecisionEngine:
         return self.evaluate(state, options)
 
     def select_build_toolchain(self, target_lang: str, state: CompilerState) -> DrexDecisionResult:
-        """Micro-tier decision for toolchain selection (CMake vs Makefile, Maven vs Gradle)."""
-        if target_lang == "cpp":
+        """Micro-tier decision for toolchain selection (CMake vs Makefile, Maven vs Gradle, Node TS/ESM/CJS)."""
+        t = target_lang.lower()
+        if t == "cpp":
             options = [
                 TypedOption(
                     option_id="toolchain_cmake",
@@ -164,6 +166,55 @@ class DrexDecisionEngine:
                     estimated_memory_mb=4.0,
                     metadata={"description": "Direct POSIX Makefile execution"}
                 )
+            ]
+        elif t in ("ts", "typescript"):
+            options = [
+                TypedOption(
+                    option_id="toolchain_node_native_ts",
+                    category="toolchain",
+                    flags=["node", "--experimental-strip-types"],
+                    estimated_latency_factor=0.45,
+                    estimated_memory_mb=18.0,
+                    metadata={"description": "Zero-transpile Node native TypeScript type-stripping"},
+                ),
+                TypedOption(
+                    option_id="toolchain_node_tsc",
+                    category="toolchain",
+                    flags=["tsc", "--noEmit"],
+                    estimated_latency_factor=1.2,
+                    estimated_memory_mb=48.0,
+                    metadata={"description": "Full TypeScript compiler type-check & verification"},
+                ),
+            ]
+        elif t in ("cjs", "commonjs"):
+            options = [
+                TypedOption(
+                    option_id="toolchain_node_cjs",
+                    category="toolchain",
+                    flags=["node"],
+                    estimated_latency_factor=0.5,
+                    estimated_memory_mb=16.0,
+                    metadata={"description": "Standard Node.js CommonJS runtime execution"},
+                ),
+            ]
+        elif t in NODE_TARGETS:
+            options = [
+                TypedOption(
+                    option_id="toolchain_node_esm",
+                    category="toolchain",
+                    flags=["node", "--input-type=module"],
+                    estimated_latency_factor=0.4,
+                    estimated_memory_mb=18.0,
+                    metadata={"description": "Direct Node.js V8 ES2024 module execution"},
+                ),
+                TypedOption(
+                    option_id="toolchain_node_cjs",
+                    category="toolchain",
+                    flags=["node"],
+                    estimated_latency_factor=0.5,
+                    estimated_memory_mb=16.0,
+                    metadata={"description": "Standard Node.js CommonJS runtime execution"},
+                ),
             ]
         else:
             options = [

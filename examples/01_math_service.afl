@@ -15,6 +15,11 @@ target java {
     package: "com.examples.math";
 }
 
+target node {
+    variant: esm;
+    package: "@examples/math";
+}
+
 // Artifact Lineage (PRD / ADR / HLD / LLD)
 artifact prd "PRD-MATH-001" {
     feature: "High-Performance Numerical Operations";

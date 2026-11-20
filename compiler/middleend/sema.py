@@ -8,6 +8,9 @@ and cross-declaration verification.
 
 from typing import Dict, Any, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
+from compiler.backend.node_emitter import NODE_TARGETS, VALID_NODE_VARIANTS
+
+SUPPORTED_TARGETS = {"cpp", "java"} | NODE_TARGETS
 
 PRIMITIVE_TYPES = {
     "i32", "i64", "u32", "u64", "f32", "f64", "bool", "string", "void"
@@ -91,8 +94,23 @@ class SemanticAnalyzer:
         for t in targets:
             tname = t.get("name", "").lower()
             tloc = t.get("loc", {})
-            if tname not in ("cpp", "java"):
-                self.add_error("E008", f"Unsupported target '{tname}'. Supported targets are 'cpp' and 'java'.", tloc)
+            if tname not in SUPPORTED_TARGETS:
+                self.add_error(
+                    "E008",
+                    f"Unsupported target '{tname}'. Supported targets are 'cpp', 'java', 'node', 'js', 'ts', 'ecmascript', 'esm', and 'cjs'.",
+                    tloc,
+                )
+            elif tname == "node":
+                opts = t.get("options", {})
+                raw_var = opts.get("variant") or opts.get("module_system") or opts.get("format")
+                if raw_var is not None:
+                    v_clean = str(raw_var).strip().strip('"').lower()
+                    if v_clean not in VALID_NODE_VARIANTS:
+                        self.add_error(
+                            "E008",
+                            f"Unsupported Node target variant '{raw_var}'. Expected 'ts', 'esm', or 'cjs'.",
+                            tloc,
+                        )
             if tname in seen_targets:
                 self.add_warning("W105", f"Duplicate target directive for '{tname}'.", tloc)
             seen_targets.add(tname)

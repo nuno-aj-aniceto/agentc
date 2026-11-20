@@ -11,6 +11,14 @@ import re
 import json
 from typing import Dict, Any, Tuple, List, Optional
 from compiler.backend.expr_lowering import ExprLowerer
+from compiler.backend.node_emitter import (
+    NodeEmitter,
+    TYPE_MAP_TS,
+    is_node_target,
+    resolve_node_variant,
+    variant_extension,
+    extract_state_machine_info,
+)
 
 TYPE_MAP_CPP = {
     "i64": "int64_t",
@@ -80,10 +88,14 @@ class AgentSynthesizer:
                    target: str, target_options: Dict[str, str],
                    artifacts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
         artifacts = artifacts or []
-        if target.lower() == "cpp":
+        t_lower = target.lower()
+        if t_lower == "cpp":
             return self._synthesize_cpp(contract, agent_impl, target_options, artifacts)
-        elif target.lower() == "java":
+        elif t_lower == "java":
             return self._synthesize_java(contract, agent_impl, target_options, artifacts)
+        elif is_node_target(t_lower):
+            variant = resolve_node_variant(t_lower, target_options)
+            return self._synthesize_node(contract, agent_impl, target_options, artifacts, variant)
         else:
             raise ValueError(f"Unsupported target toolchain: {target}")
 
@@ -962,5 +974,578 @@ class AgentSynthesizer:
             "        System.exit(1);",
             "    }",
             "}"
+        ])
+        return lines
+
+    def _synthesize_node(
+        self,
+        contract: Dict[str, Any],
+        agent_impl: Dict[str, Any],
+        options: Dict[str, str],
+        artifacts: List[Dict[str, Any]],
+        variant: str = "esm",
+    ) -> Dict[str, str]:
+        cname = contract["name"]
+        ext = variant_extension(variant)
+        is_ts = variant == "ts"
+        is_cjs = variant == "cjs"
+
+        functions = contract.get("functions", [])
+        fn_names = {f.get("name", "") for f in functions}
+        needs_crypto = bool(fn_names & {"issueToken", "validateToken", "revokeToken"})
+        sm_info = extract_state_machine_info(contract)
+        has_sm = sm_info is not None
+
+        # 1. Main Module: src/{cname}.{ext}
+        lines = self._build_lineage_header(f"{cname}.{ext}", cname, artifacts, f"node-{variant}")
+        if is_cjs:
+            lines.append('"use strict";')
+            lines.append("")
+
+        if needs_crypto:
+            if is_cjs:
+                lines.append('const { randomBytes, timingSafeEqual } = require("node:crypto");')
+                lines.append('const { Buffer } = require("node:buffer");')
+            else:
+                lines.append('import { randomBytes, timingSafeEqual } from "node:crypto";')
+                lines.append('import { Buffer } from "node:buffer";')
+            lines.append("")
+
+        export_prefix = "" if is_cjs else "export "
+        exported_symbols: List[str] = [cname]
+
+        for t in contract.get("types", []):
+            tkind = t.get("kind")
+            tname = t.get("name", "")
+            if tkind == "alias":
+                mapped = TYPE_MAP_TS.get(t.get("alias_target", ""), t.get("alias_target", "unknown"))
+                if is_ts:
+                    lines.append(f"export type {tname} = {mapped};")
+                else:
+                    lines.append(f"/** @typedef {{{mapped}}} {tname} */")
+            elif tkind == "enum":
+                variants = t.get("variants", [])
+                entries = ", ".join([f'{v}: "{v}"' for v in variants])
+                const_suffix = " as const" if is_ts else ""
+                lines.append(f"{export_prefix}const {tname} = Object.freeze({{ {entries} }}{const_suffix});")
+                if is_ts:
+                    lines.append(f"export type {tname} = (typeof {tname})[keyof typeof {tname}];")
+                if tname not in exported_symbols:
+                    exported_symbols.append(tname)
+            elif tkind == "struct":
+                if is_ts:
+                    lines.append(f"export interface {tname} {{")
+                    for f in t.get("fields", []):
+                        ft = TYPE_MAP_TS.get(f.get("type", ""), f.get("type", "unknown"))
+                        lines.append(f"    {f['name']}: {ft};")
+                    lines.append("}")
+                else:
+                    lines.append(f"/** @typedef {{Object}} {tname}")
+                    for f in t.get("fields", []):
+                        ft = TYPE_MAP_TS.get(f.get("type", ""), f.get("type", "*"))
+                        lines.append(f" * @property {{{ft}}} {f['name']}")
+                    lines.append(" */")
+        if contract.get("types"):
+            lines.append("")
+
+        state_obj_name = f"{cname}State"
+        init_state = "Initial"
+        if sm_info:
+            init_state = sm_info["initial_state"]
+            entries = ", ".join([f'{s}: "{s}"' for s in sm_info["states"]])
+            const_suffix = " as const" if is_ts else ""
+            lines.append(f"{export_prefix}const {state_obj_name} = Object.freeze({{ {entries} }}{const_suffix});")
+            if is_ts:
+                lines.append(f"export type {state_obj_name} = (typeof {state_obj_name})[keyof typeof {state_obj_name}];")
+            lines.append("")
+            if state_obj_name not in exported_symbols:
+                exported_symbols.append(state_obj_name)
+
+        for tr in contract.get("traces", []):
+            lines.append(f"// @trace {tr}")
+        lines.append(f"{export_prefix}class {cname} {{")
+
+        if sm_info:
+            if is_ts:
+                lines.append(f"    static readonly State = {state_obj_name};")
+                lines.append(f"    private state: {state_obj_name} = {state_obj_name}.{init_state};")
+            else:
+                lines.append(f"    static State = {state_obj_name};")
+                lines.append(f"    #state = {state_obj_name}.{init_state};")
+
+        if needs_crypto:
+            if is_ts:
+                lines.append("    private readonly tokenStore: Map<string, number> = new Map();")
+                lines.append("    private readonly revokedTokens: Set<string> = new Set();")
+            else:
+                lines.append("    #tokenStore = new Map();")
+                lines.append("    #revokedTokens = new Set();")
+
+        lines.append("")
+        lines.append("    constructor() {}")
+
+        if sm_info:
+            if is_ts:
+                lines.append("")
+                lines.append(f"    getState(): {state_obj_name} {{")
+                lines.append("        return this.state;")
+                lines.append("    }")
+                lines.append("")
+                lines.append(f"    setState(nextState: {state_obj_name}): void {{")
+                lines.append("        this.state = nextState;")
+                lines.append("    }")
+            else:
+                lines.append("")
+                lines.append("    getState() {")
+                lines.append("        return this.#state;")
+                lines.append("    }")
+                lines.append("")
+                lines.append("    setState(nextState) {")
+                lines.append("        this.#state = nextState;")
+                lines.append("    }")
+
+        lines.append("")
+
+        for fn in functions:
+            for tr in fn.get("traces", []):
+                lines.append(f"    // @trace {tr}")
+            fname = fn["name"]
+            raw_ret = fn.get("return_type", "void")
+            ret_ts = TYPE_MAP_TS.get(raw_ret, raw_ret)
+            params = fn.get("parameters", [])
+            param_scope: Dict[str, str] = {}
+            sig_parts: List[str] = []
+            type_guards: List[str] = []
+
+            for p in params:
+                pname = p["name"]
+                ptype = p["type"]
+                param_scope[pname] = ptype
+                if is_ts:
+                    sig_parts.append(f"{pname}: {TYPE_MAP_TS.get(ptype, ptype)}")
+                else:
+                    sig_parts.append(pname)
+
+                if ptype == "u32":
+                    type_guards.append(
+                        f'        if (typeof {pname} !== "number" || !Number.isInteger({pname}) || {pname} < 0 || {pname} > 0xFFFFFFFF) '
+                        f'throw new RangeError(`u32 out of range: ${{{pname}}}`);'
+                    )
+                elif ptype == "i32":
+                    type_guards.append(
+                        f'        if (typeof {pname} !== "number" || !Number.isInteger({pname}) || {pname} < -2147483648 || {pname} > 2147483647) '
+                        f'throw new RangeError(`i32 out of range: ${{{pname}}}`);'
+                    )
+                elif ptype == "u64":
+                    type_guards.append(
+                        f'        if (typeof {pname} !== "number" || !Number.isInteger({pname}) || {pname} < 0) '
+                        f'throw new RangeError(`u64 must be non-negative: ${{{pname}}}`);'
+                    )
+                elif ptype == "i64":
+                    type_guards.append(
+                        f'        if (typeof {pname} !== "number" || !Number.isInteger({pname})) '
+                        f'throw new TypeError(`i64 must be an integer: ${{{pname}}}`);'
+                    )
+                elif ptype in ("f32", "f64"):
+                    type_guards.append(
+                        f'        if (typeof {pname} !== "number" || Number.isNaN({pname})) '
+                        f'throw new TypeError(`{ptype} must be a valid number: ${{{pname}}}`);'
+                    )
+                elif ptype == "string":
+                    type_guards.append(
+                        f'        if (typeof {pname} !== "string") '
+                        f'throw new TypeError("Expected string for parameter \'{pname}\'");'
+                    )
+                elif ptype == "bool":
+                    type_guards.append(
+                        f'        if (typeof {pname} !== "boolean") '
+                        f'throw new TypeError("Expected boolean for parameter \'{pname}\'");'
+                    )
+
+            sig_str = ", ".join(sig_parts)
+            ret_annot = f": {ret_ts}" if is_ts else ""
+            lines.append(f"    {fname}({sig_str}){ret_annot} {{")
+            lines.extend(type_guards)
+
+            pre_texts = fn.get("preconditions", [])
+            pre_asts = fn.get("preconditions_ast", [])
+            for idx, pre_text in enumerate(pre_texts):
+                if idx < len(pre_asts):
+                    js_cond = ExprLowerer.lower(pre_asts[idx], "node", param_scope)
+                else:
+                    js_cond = self._legacy_translate_java(pre_text)
+                lines.append(f"        if (!({js_cond})) {{")
+                lines.append(f'            throw new Error("Precondition failed: {escape_str_literal(pre_text)}");')
+                lines.append("        }")
+
+            trans = fn.get("transition")
+            if trans:
+                f_st = trans.get("from", "")
+                t_st = trans.get("to", "")
+                state_ref = "this.state" if is_ts else "this.#state"
+                lines.append(f"        if ({state_ref} !== {state_obj_name}.{f_st}) {{")
+                lines.append(f'            throw new Error(`Invalid state transition from ${{{state_ref}}} to {t_st}`);')
+                lines.append("        }")
+                lines.append(f"        {state_ref} = {state_obj_name}.{t_st};")
+
+            post_scope = dict(param_scope)
+            if raw_ret != "void":
+                post_scope["result"] = raw_ret
+            body = self._generate_fn_body_node(cname, fname, fn, post_scope, is_ts)
+            lines.extend(body)
+            lines.append("    }")
+            lines.append("")
+
+        lines.append("}")
+        if is_cjs:
+            lines.append("")
+            lines.append(f"module.exports = {{ {', '.join(exported_symbols)} }};")
+
+        files: Dict[str, str] = {
+            os.path.join("src", f"{cname}.{ext}"): "\n".join(lines),
+            os.path.join("test", f"{cname}.test.{ext}"): "\n".join(
+                self._generate_node_tests(cname, contract, artifacts, variant)
+            ),
+            os.path.join("src", f"{cname}_cli.{ext}"): "\n".join(
+                self._generate_node_cli(cname, contract, variant)
+            ),
+        }
+        if not is_ts:
+            files[os.path.join("src", f"{cname}.d.ts")] = NodeEmitter.generate_dts(contract, artifacts)
+        return files
+
+    def _generate_fn_body_node(
+        self,
+        cname: str,
+        fname: str,
+        fn: Dict[str, Any],
+        scope: Dict[str, str],
+        is_ts: bool,
+    ) -> List[str]:
+        post_texts = fn.get("postconditions", [])
+        post_asts = fn.get("postconditions_ast", [])
+
+        old_preludes = []
+        old_seen = set()
+        for past in post_asts:
+            for old_n in self._find_old_nodes(past):
+                safe_name = ExprLowerer("", {})._safe_var_name(old_n)
+                if safe_name not in old_seen:
+                    old_seen.add(safe_name)
+                    lowered = ExprLowerer.lower(old_n, "node", scope)
+                    old_preludes.append(f"        const _old_{safe_name} = {lowered};")
+
+        post_checks = []
+        for idx, post_text in enumerate(post_texts):
+            if idx < len(post_asts):
+                cond_str = ExprLowerer.lower(post_asts[idx], "node", scope)
+            else:
+                cond_str = self._legacy_translate_java(post_text)
+            post_checks.append(
+                f'        if (!({cond_str})) throw new Error("Postcondition failed: {escape_str_literal(post_text)}");'
+            )
+
+        raw_ret = fn.get("return_type", "void")
+        ret_ts = TYPE_MAP_TS.get(raw_ret, raw_ret)
+        res_decl = f"const result: {ret_ts}" if is_ts else "const result"
+        store_ref = "this.tokenStore" if is_ts else "this.#tokenStore"
+        revoked_ref = "this.revokedTokens" if is_ts else "this.#revokedTokens"
+
+        def with_prelude(body_lines: List[str]) -> List[str]:
+            return old_preludes + body_lines
+
+        if fname == "add":
+            return with_prelude([f"        {res_decl} = a + b;"] + post_checks + ["        return result;"])
+        elif fname == "divide":
+            return with_prelude([f"        {res_decl} = numerator / denominator;"] + post_checks + ["        return result;"])
+        elif fname == "clamp":
+            return with_prelude(
+                [f"        {res_decl} = Math.max(min_val, Math.min(max_val, value));"]
+                + post_checks
+                + ["        return result;"]
+            )
+        elif fname == "factorial":
+            return with_prelude(
+                [
+                    "        let acc = 1n;",
+                    "        for (let i = 2n; i <= BigInt(n); i += 1n) { acc *= i; }",
+                    f"        {res_decl} = Number(acc);",
+                ]
+                + post_checks
+                + ["        return result;"]
+            )
+        elif fname == "issueToken":
+            return with_prelude(
+                [
+                    '        const token = randomBytes(24).toString("hex");',
+                    "        const expiry = Math.floor(Date.now() / 1000) + ttlSeconds;",
+                    f"        {store_ref}.set(token, expiry);",
+                    f"        {res_decl} = token;",
+                ]
+                + post_checks
+                + ["        return result;"]
+            )
+        elif fname == "validateToken":
+            exp_annot = ": number | null" if is_ts else ""
+            return with_prelude(
+                [
+                    f"        if ({revoked_ref}.has(token)) {{",
+                    f"            {res_decl} = false;",
+                    "            return result;",
+                    "        }",
+                    '        const tokenBuf = Buffer.from(token, "utf8");',
+                    f"        let matchedExpiry{exp_annot} = null;",
+                    f"        for (const [storedToken, exp] of {store_ref}.entries()) {{",
+                    '            const storedBuf = Buffer.from(storedToken, "utf8");',
+                    "            if (storedBuf.length === tokenBuf.length && timingSafeEqual(storedBuf, tokenBuf)) {",
+                    "                matchedExpiry = exp;",
+                    "            }",
+                    "        }",
+                    "        if (matchedExpiry === null) {",
+                    f"            {res_decl} = false;",
+                    "            return result;",
+                    "        }",
+                    "        const now = Math.floor(Date.now() / 1000);",
+                    f"        {res_decl} = now <= matchedExpiry;",
+                ]
+                + post_checks
+                + ["        return result;"]
+            )
+        elif fname == "revokeToken":
+            return with_prelude(
+                [
+                    f"        if (!{store_ref}.has(token)) {{",
+                    f"            {res_decl} = false;",
+                    "            return result;",
+                    "        }",
+                    f"        {revoked_ref}.add(token);",
+                    f"        {res_decl} = true;",
+                ]
+                + post_checks
+                + ["        return result;"]
+            )
+        else:
+            if post_asts and post_asts[0].get("op") == "==":
+                first_post = post_asts[0]
+                args = first_post.get("args", [])
+                if len(args) == 2 and args[0].get("value") == "result":
+                    expr_str = ExprLowerer.lower(args[1], "node", scope)
+                    return with_prelude([f"        {res_decl} = {expr_str};"] + post_checks + ["        return result;"])
+
+            if ret_ts == "boolean":
+                return with_prelude([f"        {res_decl} = true;"] + post_checks + ["        return result;"])
+            elif ret_ts == "void":
+                return with_prelude(post_checks + ["        return;"])
+            elif ret_ts == "string":
+                return with_prelude([f'        {res_decl} = "ok";'] + post_checks + ["        return result;"])
+            else:
+                return with_prelude([f"        {res_decl} = 0;"] + post_checks + ["        return result;"])
+
+    def _generate_node_tests(
+        self,
+        cname: str,
+        contract: Dict[str, Any],
+        artifacts: List[Dict[str, Any]],
+        variant: str,
+    ) -> List[str]:
+        ext = variant_extension(variant)
+        is_cjs = variant == "cjs"
+        lines = self._build_lineage_header(f"{cname}.test.{ext}", cname, artifacts, f"node-{variant}")
+        if is_cjs:
+            lines.extend([
+                '"use strict";',
+                'const test = require("node:test");',
+                'const assert = require("node:assert/strict");',
+                f'const {{ {cname} }} = require("../src/{cname}.cjs");',
+                "",
+            ])
+        else:
+            lines.extend([
+                'import test from "node:test";',
+                'import assert from "node:assert/strict";',
+                f'import {{ {cname} }} from "../src/{cname}.{ext}";',
+                "",
+            ])
+
+        if cname == "MathOperations":
+            lines.extend([
+                'test("MathOperations arithmetic and contract guards", () => {',
+                "    const service = new MathOperations();",
+                "    assert.equal(service.add(10, 20), 30);",
+                "    assert.equal(service.add(-5, 5), 0);",
+                "    assert.equal(service.divide(10, 2), 5);",
+                "    assert.throws(() => service.divide(10, 0), /Precondition failed/);",
+                "    assert.equal(service.clamp(15, 0, 10), 10);",
+                "    assert.equal(service.clamp(-5, 0, 10), 0);",
+                "    assert.equal(service.clamp(7, 0, 10), 7);",
+                "    assert.throws(() => service.clamp(5, 10, 0), /Precondition failed/);",
+                "    assert.equal(service.factorial(0), 1);",
+                "    assert.equal(service.factorial(5), 120);",
+                "    assert.throws(() => service.factorial(25), /Precondition failed/);",
+                "});",
+            ])
+        elif cname == "TokenStore":
+            lines.extend([
+                'test("TokenStore issuance, validation, and revocation", () => {',
+                "    const service = new TokenStore();",
+                '    const token = service.issueToken("user123", 3600);',
+                "    assert.ok(token.length >= 32);",
+                "    assert.equal(service.validateToken(token), true);",
+                '    assert.throws(() => service.issueToken("", 3600), /Precondition failed/);',
+                '    assert.throws(() => service.issueToken("user", 10), /Precondition failed/);',
+                "    assert.equal(service.revokeToken(token), true);",
+                "    assert.equal(service.validateToken(token), false);",
+                "});",
+            ])
+        elif cname == "OrderService":
+            lines.extend([
+                'test("OrderService state machine, old(), and unit bounds", () => {',
+                "    const service = new OrderService();",
+                "    assert.equal(service.getState(), OrderService.State.Created);",
+                '    assert.throws(() => service.fulfillOrder("ord_1", 100), /Invalid state transition/);',
+                "    service.setState(OrderService.State.Processing);",
+                '    assert.equal(service.fulfillOrder("ord_1", 100), 90);',
+                "    assert.equal(service.getState(), OrderService.State.Fulfilled);",
+                "    assert.equal(service.checkTimeout(100), true);",
+                "    assert.throws(() => service.checkTimeout(600), /Precondition failed/);",
+                "});",
+            ])
+        elif cname == "RateLimiter":
+            lines.extend([
+                'test("RateLimiter state transitions, old() quota, and unit budgets", () => {',
+                "    const service = new RateLimiter();",
+                "    assert.equal(service.getState(), RateLimiter.State.Closed);",
+                '    assert.equal(service.consumeQuota("client_1", 100, 25), 75);',
+                '    assert.throws(() => service.consumeQuota("client_1", 10, 25), /Precondition failed/);',
+                "    assert.throws(() => service.probeRecovery(600), /Invalid state transition/);",
+                "    assert.equal(service.tripCircuit(1200), true);",
+                "    assert.equal(service.getState(), RateLimiter.State.Open);",
+                "    assert.equal(service.probeRecovery(600), true);",
+                "    assert.equal(service.getState(), RateLimiter.State.HalfOpen);",
+                "    assert.equal(service.closeCircuit(3), true);",
+                "    assert.equal(service.getState(), RateLimiter.State.Closed);",
+                "    assert.equal(service.checkWindowBudget(500, 4096), true);",
+                "    assert.throws(() => service.checkWindowBudget(1500, 4096), /Precondition failed/);",
+                "    assert.throws(() => service.checkWindowBudget(500, 100000), /Precondition failed/);",
+                "});",
+            ])
+        elif cname == "PayloadGuard":
+            lines.extend([
+                'test("PayloadGuard implies, string length, clamp, and unit rules", () => {',
+                "    const service = new PayloadGuard();",
+                '    assert.equal(service.acceptPayload("application/json", 1024, false), true);',
+                '    assert.throws(() => service.acceptPayload("application/json", 100000, false), /Precondition failed/);',
+                '    assert.equal(service.acceptPayload("application/json", 100000, true), true);',
+                '    assert.throws(() => service.acceptPayload("application/json", 2000000, true), /Precondition failed/);',
+                "    assert.equal(service.clampBatchSize(200, 1, 100), 100);",
+                '    assert.equal(service.isJsonContent("application/json"), true);',
+                '    assert.equal(service.isJsonContent("text/plain"), false);',
+                "});",
+            ])
+        else:
+            lines.extend([
+                f'test("{cname} contract smoke test", () => {{',
+                f"    const service = new {cname}();",
+                "    assert.ok(service);",
+                "});",
+            ])
+        lines.append("")
+        return lines
+
+    def _generate_node_cli(
+        self,
+        cname: str,
+        contract: Dict[str, Any],
+        variant: str,
+    ) -> List[str]:
+        ext = variant_extension(variant)
+        is_cjs = variant == "cjs"
+        lines: List[str] = []
+        if is_cjs:
+            lines.extend([
+                '"use strict";',
+                'const process = require("node:process");',
+                f'const {{ {cname} }} = require("./{cname}.cjs");',
+            ])
+        else:
+            lines.extend([
+                'import process from "node:process";',
+                f'import {{ {cname} }} from "./{cname}.{ext}";',
+            ])
+
+        lines.extend([
+            "",
+            f"const service = new {cname}();",
+            "const args = process.argv.slice(2);",
+            "",
+            'if (args.length === 0 || args[0] === "selftest") {',
+            f'    console.log("[agentc CLI] Executing contract selftest for {cname} (Node {variant})...");',
+        ])
+
+        for fn in contract.get("functions", []):
+            fname = fn["name"]
+            if fname == "add":
+                lines.append("    if (service.add(2, 3) !== 5) process.exit(1);")
+            elif fname == "divide":
+                lines.append("    if (service.divide(10, 2) !== 5) process.exit(1);")
+            elif fname == "clamp":
+                lines.append("    if (service.clamp(15, 0, 10) !== 10) process.exit(1);")
+            elif fname == "issueToken":
+                lines.append('    if (service.issueToken("cli_user", 3600).length < 32) process.exit(1);')
+            elif fname == "fulfillOrder":
+                lines.append("    service.setState(OrderService.State.Processing);")
+                lines.append('    if (service.fulfillOrder("cli_ord", 100) !== 90) process.exit(1);')
+            elif fname == "consumeQuota":
+                lines.append('    if (service.consumeQuota("cli_client", 100, 25) !== 75) process.exit(1);')
+            elif fname == "isJsonContent":
+                lines.append('    if (!service.isJsonContent("application/json")) process.exit(1);')
+
+        lines.extend([
+            f'    console.log("[+] All contract checks for {cname} passed!");',
+            "    process.exit(0);",
+            "}",
+            "",
+            "const cmd = args[0];",
+        ])
+
+        for fn in contract.get("functions", []):
+            fname = fn["name"]
+            params = fn.get("parameters", [])
+            lines.append(f'if (cmd === "{fname}") {{')
+            lines.append(f"    if (args.length < {len(params) + 1}) {{")
+            lines.append(f'        console.error("Error: {fname} requires {len(params)} argument(s)");')
+            lines.append("        process.exit(2);")
+            lines.append("    }")
+            lines.append("    try {")
+            call_args = []
+            for p_i, p in enumerate(params):
+                ptype = p.get("type", "")
+                arg_expr = f"args[{p_i + 1}]"
+                if ptype in ("i64", "i32", "u64", "u32", "f64", "f32"):
+                    call_args.append(f"Number({arg_expr})")
+                elif ptype == "bool":
+                    call_args.append(f'({arg_expr} === "true")')
+                else:
+                    call_args.append(arg_expr)
+
+            call_str = f"service.{fname}({', '.join(call_args)})"
+            if fn.get("return_type") == "void":
+                lines.append(f"        {call_str};")
+                lines.append("        console.log(JSON.stringify({ result: null }));")
+            else:
+                lines.append(f"        const res = {call_str};")
+                lines.append("        console.log(JSON.stringify({ result: res }));")
+            lines.append("        process.exit(0);")
+            lines.append("    } catch (err) {")
+            lines.append("        const msg = err instanceof Error ? err.message : String(err);")
+            lines.append("        console.error(JSON.stringify({ error: msg }));")
+            lines.append("        process.exit(2);")
+            lines.append("    }")
+            lines.append("}")
+
+        lines.extend([
+            'console.error(`Unknown command: ${cmd}`);',
+            "process.exit(1);",
+            "",
         ])
         return lines

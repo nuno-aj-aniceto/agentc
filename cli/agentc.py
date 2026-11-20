@@ -25,6 +25,13 @@ from compiler.middleend.drex_engine import DrexDecisionEngine, CompilerState
 from compiler.middleend.sema import SemanticAnalyzer
 from compiler.backend.cpp_emitter import CppEmitter
 from compiler.backend.java_emitter import JavaEmitter
+from compiler.backend.node_emitter import (
+    NodeEmitter,
+    NODE_TARGETS,
+    is_node_target,
+    resolve_node_variant,
+    variant_extension,
+)
 from compiler.backend.container_emitter import ContainerEmitter
 from compiler.backend.toolchain_runner import ToolchainRunner
 from compiler.repair.auto_healer import AutoHealer
@@ -145,6 +152,13 @@ def cmd_build(args):
         if t["name"].lower() == target_lang:
             target_options = t.get("options", {})
             break
+    if not target_options and is_node_target(target_lang):
+        for t in ast.get("targets", []):
+            if t["name"].lower() in NODE_TARGETS:
+                target_options = t.get("options", {})
+                break
+
+    node_variant = resolve_node_variant(target_lang, target_options) if is_node_target(target_lang) else ""
 
     # Extract package options from lifecycle block
     package_options = {}
@@ -171,7 +185,8 @@ def cmd_build(args):
     )
 
     drex = DrexDecisionEngine(offline_mode=True)
-    drex_res = drex.select_cpp_compiler_flags(compiler_state) if target_lang == "cpp" else drex.select_build_toolchain(target_lang, compiler_state)
+    drex_target = node_variant if is_node_target(target_lang) else target_lang
+    drex_res = drex.select_cpp_compiler_flags(compiler_state) if target_lang == "cpp" else drex.select_build_toolchain(drex_target, compiler_state)
     drex_flags = drex_res.selected_option.flags
 
     print(f"  -> [Stage 2] Dual-Tier AI Reasoning Topology:")
@@ -222,6 +237,13 @@ def cmd_build(args):
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(content)
 
+        elif is_node_target(target_lang):
+            for fname, content in generated_files.items():
+                out_path = os.path.join(work_base, fname)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+
     # 4. Write Unified Build Configuration (Multi-contract support)
     if target_lang == "cpp":
         cmakelists = CppEmitter.generate_cmakelists(module_name, contract_names, target_options, drex_flags, artifacts)
@@ -241,6 +263,20 @@ def cmd_build(args):
         with open(os.path.join(work_base, "Makefile"), "w", encoding="utf-8") as f:
             f.write(makefile)
 
+    elif is_node_target(target_lang):
+        pkg_json = NodeEmitter.generate_package_json(module_name, contract_names, target_options, node_variant, artifacts)
+        with open(os.path.join(work_base, "package.json"), "w", encoding="utf-8") as f:
+            f.write(pkg_json)
+
+        if node_variant == "ts":
+            tsconfig = NodeEmitter.generate_tsconfig(target_options)
+            with open(os.path.join(work_base, "tsconfig.json"), "w", encoding="utf-8") as f:
+                f.write(tsconfig)
+
+        makefile = NodeEmitter.generate_makefile(module_name, contract_names, target_options, node_variant, artifacts)
+        with open(os.path.join(work_base, "Makefile"), "w", encoding="utf-8") as f:
+            f.write(makefile)
+
     # 5. Write Containerfile and .containerignore (Phase 6)
     containerfile = ContainerEmitter.generate_containerfile(
         module_name, contract_names, target_lang, package_options, target_options, artifacts
@@ -254,15 +290,18 @@ def cmd_build(args):
     # 6. Native Toolchain Build and Verification
     build_sys = getattr(args, "build_system", "auto")
     use_cmake = (build_sys == "cmake") or (build_sys == "auto" and bool(shutil.which("cmake")))
-    print(f"  -> [Stage 4] Invoking native toolchain in '{work_base}' (engine: {'CMake' if use_cmake and target_lang == 'cpp' else 'Makefile'})...")
+    engine_label = "CMake" if (use_cmake and target_lang == "cpp") else (f"Node-{node_variant}" if is_node_target(target_lang) else "Makefile")
+    print(f"  -> [Stage 4] Invoking native toolchain in '{work_base}' (engine: {engine_label})...")
 
     runner = ToolchainRunner(work_base)
     for cname in contract_names:
         if target_lang == "cpp":
             build_res = runner.run_cpp(cname, use_cmake=use_cmake)
-        else:
+        elif target_lang == "java":
             pkg = target_options.get("package", "com.agentlang.generated")
             build_res = runner.run_java(cname, pkg, use_mvn=False)
+        else:
+            build_res = runner.run_node(cname, variant=node_variant)
 
         if not build_res["success"]:
             print(f"[-] Build failed at stage '{build_res['stage']}':")
@@ -337,21 +376,75 @@ def cmd_package(args):
         print(f"[+] Image pushed to {push_tag}")
 
 def cmd_run(args):
-    """Runs a function or selftest via the packaged container image."""
+    """Runs a contract function or selftest on the host or via the packaged container image."""
     ast = parse_afl_to_ast(args.file)
-    safe_mod = ast.get("module_name", "app").replace(".", "-").lower()
-    tag = args.tag or "latest"
-    for l in ast.get("lifecycles", []):
-        opt_tag = l.get("package", {}).get("options", {}).get("tag")
-        if opt_tag and not args.tag:
-            tag = opt_tag
+    target_lang = args.target.lower()
+    contracts = ast.get("contracts", [])
+    cname = contracts[0]["name"] if contracts else "App"
+
+    if getattr(args, "container", False):
+        safe_mod = ast.get("module_name", "app").replace(".", "-").lower()
+        tag = args.tag or "latest"
+        for l in ast.get("lifecycles", []):
+            opt_tag = l.get("package", {}).get("options", {}).get("tag")
+            if opt_tag and not args.tag:
+                tag = opt_tag
+                break
+
+        image_name = f"localhost/{safe_mod}-{target_lang}:{tag}"
+        engine = "podman" if shutil.which("podman") else "docker"
+
+        cmd = [engine, "run", "--rm", image_name] + args.cmd_args
+        print(f"[*] Executing: {' '.join(cmd)}")
+        res = subprocess.run(cmd)
+        sys.exit(res.returncode)
+
+    work_base = os.path.join(".agentc", "build", target_lang)
+    target_options = {}
+    for t in ast.get("targets", []):
+        if t["name"].lower() == target_lang:
+            target_options = t.get("options", {})
             break
+    if not target_options and is_node_target(target_lang):
+        for t in ast.get("targets", []):
+            if t["name"].lower() in NODE_TARGETS:
+                target_options = t.get("options", {})
+                break
 
-    image_name = f"localhost/{safe_mod}-{args.target.lower()}:{tag}"
-    engine = "podman" if shutil.which("podman") else "docker"
+    if target_lang == "cpp":
+        cli_bin = os.path.join(work_base, "build", f"{cname}_cli")
+        if not os.path.exists(cli_bin):
+            cli_bin = os.path.join(work_base, f"{cname}_cli")
+        if not os.path.exists(cli_bin):
+            args.out_dir = None
+            args.build_system = "auto"
+            args.force = False
+            cmd_build(args)
+            cli_bin = os.path.join(work_base, "build", f"{cname}_cli")
+            if not os.path.exists(cli_bin):
+                cli_bin = os.path.join(work_base, f"{cname}_cli")
+        cmd = [cli_bin] + (args.cmd_args or ["selftest"])
+    elif target_lang == "java":
+        classes_dir = os.path.join(work_base, "target", "classes")
+        pkg = target_options.get("package", "com.agentlang.generated")
+        cli_class = f"{pkg}.{cname}Cli"
+        if not os.path.exists(os.path.join(classes_dir, pkg.replace(".", "/"), f"{cname}Cli.class")):
+            args.out_dir = None
+            args.build_system = "auto"
+            args.force = False
+            cmd_build(args)
+        cmd = ["java", "-cp", classes_dir, cli_class] + (args.cmd_args or ["selftest"])
+    else:
+        variant = resolve_node_variant(target_lang, target_options)
+        ext = variant_extension(variant)
+        cli_script = os.path.join(work_base, "src", f"{cname}_cli.{ext}")
+        if not os.path.exists(cli_script):
+            args.out_dir = None
+            args.build_system = "auto"
+            args.force = False
+            cmd_build(args)
+        cmd = ["node", cli_script] + (args.cmd_args or ["selftest"])
 
-    cmd = [engine, "run", "--rm", image_name] + args.cmd_args
-    print(f"[*] Executing: {' '.join(cmd)}")
     res = subprocess.run(cmd)
     sys.exit(res.returncode)
 
@@ -391,10 +484,12 @@ def main():
     p_inspect.add_argument("file", help="Path to .afl file")
     p_inspect.set_defaults(func=cmd_inspect)
 
+    target_choices = ["cpp", "java", "node", "ts", "js", "esm", "cjs"]
+
     # build
-    p_build = subparsers.add_parser("build", help="Compile .afl to target C++ or Java")
+    p_build = subparsers.add_parser("build", help="Compile .afl to target C++, Java, or Node.js (TS/ESM/CJS)")
     p_build.add_argument("file", help="Path to .afl file")
-    p_build.add_argument("--target", default="cpp", choices=["cpp", "java"], help="Target toolchain (default: cpp)")
+    p_build.add_argument("--target", default="cpp", choices=target_choices, help="Target toolchain (default: cpp)")
     p_build.add_argument("--build-system", default="auto", choices=["auto", "cmake", "make"], help="Build system (default: auto)")
     p_build.add_argument("--out-dir", help="Custom output directory")
     p_build.add_argument("--force", action="store_true", help="Bypass incremental cache")
@@ -403,7 +498,7 @@ def main():
     # package
     p_pkg = subparsers.add_parser("package", help="Build code and containerize application into OCI image (Podman/Buildah)")
     p_pkg.add_argument("file", help="Path to .afl file")
-    p_pkg.add_argument("--target", default="cpp", choices=["cpp", "java"], help="Target toolchain (default: cpp)")
+    p_pkg.add_argument("--target", default="cpp", choices=target_choices, help="Target toolchain (default: cpp)")
     p_pkg.add_argument("--build-system", default="auto", choices=["auto", "cmake", "make"], help="Build system (default: auto)")
     p_pkg.add_argument("--engine", default="auto", choices=["auto", "podman", "buildah", "docker"], help="Container engine")
     p_pkg.add_argument("--tag", help="Image tag override")
@@ -414,17 +509,18 @@ def main():
     p_pkg.set_defaults(func=cmd_package)
 
     # run
-    p_run = subparsers.add_parser("run", help="Execute command via packaged container image")
+    p_run = subparsers.add_parser("run", help="Execute contract function or selftest (host or container)")
     p_run.add_argument("file", help="Path to .afl file")
-    p_run.add_argument("--target", default="cpp", choices=["cpp", "java"], help="Target toolchain (default: cpp)")
+    p_run.add_argument("--target", default="cpp", choices=target_choices, help="Target toolchain (default: cpp)")
+    p_run.add_argument("--container", action="store_true", help="Execute inside packaged OCI container image")
     p_run.add_argument("--tag", help="Image tag override")
-    p_run.add_argument("cmd_args", nargs="*", help="Arguments passed to containerized CLI harness")
+    p_run.add_argument("cmd_args", nargs="*", help="Arguments passed to CLI harness")
     p_run.set_defaults(func=cmd_run)
 
     # test
     p_test = subparsers.add_parser("test", help="Compile and execute target verification test suite")
     p_test.add_argument("file", help="Path to .afl file")
-    p_test.add_argument("--target", default="cpp", choices=["cpp", "java"], help="Target toolchain (default: cpp)")
+    p_test.add_argument("--target", default="cpp", choices=target_choices, help="Target toolchain (default: cpp)")
     p_test.add_argument("--build-system", default="auto", choices=["auto", "cmake", "make"], help="Build system (default: auto)")
     p_test.add_argument("--out-dir", help="Custom output directory")
     p_test.add_argument("--force", action="store_true", help="Bypass incremental cache")

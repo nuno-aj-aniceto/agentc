@@ -15,6 +15,11 @@ target java {
     package: "com.corp.security";
 }
 
+target node {
+    variant: cjs;
+    package: "@corp/security";
+}
+
 // Artifact Lineage (PRD / ADR / HLD / LLD)
 artifact prd "PRD-SEC-002" {
     feature: "Cryptographic Token Management & Revocation";

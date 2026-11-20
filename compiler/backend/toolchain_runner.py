@@ -6,9 +6,11 @@ Supports seamless builds with or without CMake/Maven and verifies test execution
 """
 
 import os
+import shutil
 import subprocess
 import time
 from typing import Dict, Any, Tuple
+from compiler.backend.node_emitter import variant_extension
 
 class ToolchainRunner:
     def __init__(self, work_dir: str):
@@ -126,3 +128,107 @@ class ToolchainRunner:
                 "logs": "\n".join(logs),
                 "duration_seconds": round(time.time() - start_time, 3)
             }
+
+    def run_node(self, contract_name: str, variant: str = "esm") -> Dict[str, Any]:
+        """Runs Node.js syntax/type check, node:test unit suite, and CLI selftest."""
+        start_time = time.time()
+        logs = []
+        ext = variant_extension(variant)
+
+        src_rel = os.path.join("src", f"{contract_name}.{ext}")
+        cli_rel = os.path.join("src", f"{contract_name}_cli.{ext}")
+        test_rel = os.path.join("test", f"{contract_name}.test.{ext}")
+        dts_rel = os.path.join("src", f"{contract_name}.d.ts")
+
+        # 1. Syntax / Static Type Check
+        if variant == "ts":
+            if shutil.which("tsc"):
+                chk_cmd = ["tsc", "--noEmit"]
+                chk_res = subprocess.run(chk_cmd, cwd=self.work_dir, capture_output=True, text=True)
+                logs.append(f"=== TypeScript Check (tsc) ===\n{chk_res.stdout}\n{chk_res.stderr}")
+                if chk_res.returncode != 0:
+                    return {
+                        "success": False,
+                        "stage": "ts_typecheck",
+                        "returncode": chk_res.returncode,
+                        "logs": "\n".join(logs),
+                        "duration_seconds": round(time.time() - start_time, 3),
+                    }
+            elif shutil.which("deno"):
+                chk_cmd = ["deno", "check", "--no-config", "--no-lock", src_rel, cli_rel]
+                chk_res = subprocess.run(chk_cmd, cwd=self.work_dir, capture_output=True, text=True)
+                logs.append(f"=== TypeScript Check (deno check) ===\n{chk_res.stdout}\n{chk_res.stderr}")
+                if chk_res.returncode != 0:
+                    return {
+                        "success": False,
+                        "stage": "ts_typecheck",
+                        "returncode": chk_res.returncode,
+                        "logs": "\n".join(logs),
+                        "duration_seconds": round(time.time() - start_time, 3),
+                    }
+            else:
+                smoke_res = subprocess.run(
+                    ["node", "-e", f"import('./{src_rel.replace(os.sep, '/')}').catch(e => {{ console.error(e); process.exit(1); }})"],
+                    cwd=self.work_dir,
+                    capture_output=True,
+                    text=True,
+                )
+                logs.append(f"=== Node Native TS Parse ===\n{smoke_res.stdout}\n{smoke_res.stderr}")
+                if smoke_res.returncode != 0:
+                    return {
+                        "success": False,
+                        "stage": "ts_parse",
+                        "returncode": smoke_res.returncode,
+                        "logs": "\n".join(logs),
+                        "duration_seconds": round(time.time() - start_time, 3),
+                    }
+        else:
+            for target_file in (src_rel, cli_rel, test_rel):
+                if os.path.exists(os.path.join(self.work_dir, target_file)):
+                    chk_res = subprocess.run(["node", "--check", target_file], cwd=self.work_dir, capture_output=True, text=True)
+                    logs.append(f"=== Node Syntax Check ({target_file}) ===\n{chk_res.stdout}\n{chk_res.stderr}")
+                    if chk_res.returncode != 0:
+                        return {
+                            "success": False,
+                            "stage": "node_syntax_check",
+                            "returncode": chk_res.returncode,
+                            "logs": "\n".join(logs),
+                            "duration_seconds": round(time.time() - start_time, 3),
+                        }
+            if shutil.which("deno") and os.path.exists(os.path.join(self.work_dir, dts_rel)):
+                dts_res = subprocess.run(["deno", "check", "--no-config", "--no-lock", dts_rel], cwd=self.work_dir, capture_output=True, text=True)
+                logs.append(f"=== TypeScript Bindings Check ({dts_rel}) ===\n{dts_res.stdout}\n{dts_res.stderr}")
+                if dts_res.returncode != 0:
+                    return {
+                        "success": False,
+                        "stage": "dts_typecheck",
+                        "returncode": dts_res.returncode,
+                        "logs": "\n".join(logs),
+                        "duration_seconds": round(time.time() - start_time, 3),
+                    }
+
+        # 2. Unit Test Suite via node --test
+        if os.path.exists(os.path.join(self.work_dir, test_rel)):
+            test_res = subprocess.run(["node", "--test", test_rel], cwd=self.work_dir, capture_output=True, text=True)
+            logs.append(f"=== Node Test Runner ({test_rel}) ===\n{test_res.stdout}\n{test_res.stderr}")
+            if test_res.returncode != 0:
+                return {
+                    "success": False,
+                    "stage": "node_test",
+                    "returncode": test_res.returncode,
+                    "logs": "\n".join(logs),
+                    "test_output": test_res.stdout,
+                    "duration_seconds": round(time.time() - start_time, 3),
+                }
+
+        # 3. CLI Selftest Verification
+        cli_res = subprocess.run(["node", cli_rel, "selftest"], cwd=self.work_dir, capture_output=True, text=True)
+        logs.append(f"=== Node CLI Selftest ===\n{cli_res.stdout}\n{cli_res.stderr}")
+        return {
+            "success": (cli_res.returncode == 0),
+            "stage": "node_cli_selftest",
+            "returncode": cli_res.returncode,
+            "logs": "\n".join(logs),
+            "test_output": cli_res.stdout,
+            "duration_seconds": round(time.time() - start_time, 3),
+        }

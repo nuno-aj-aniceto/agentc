@@ -8,6 +8,7 @@ and cross-referencing runtime anomalies against PRD acceptance criteria and ADR 
 
 import re
 from typing import Dict, Any, List, Optional
+from compiler.backend.node_emitter import NODE_TARGETS
 
 class AutoHealer:
     @staticmethod
@@ -47,6 +48,57 @@ class AutoHealer:
                     "severity": "error",
                     "message": m[2]
                 })
+
+        elif language.lower() in NODE_TARGETS:
+            # Match tsc errors: file(line,col): error TSxxxx: message
+            tsc_matches = re.findall(r'([^\n(]+)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+([^\n]+)', logs)
+            for m in tsc_matches:
+                diagnostics.append({
+                    "file": m[0].strip(),
+                    "line": int(m[1]),
+                    "col": int(m[2]),
+                    "code": m[3],
+                    "severity": "error",
+                    "message": m[4],
+                })
+
+            # Match Deno TS diagnostics: TSxxxx [ERROR]: msg ... at file:///path:line:col
+            deno_matches = re.findall(
+                r'(TS\d+)\s+\[ERROR\]:\s+([^\n]+)\n(?:[^\n]*\n)*?\s+at\s+([^\s:]+://[^\s:]+|[^:\n]+):(\d+):(\d+)',
+                logs,
+            )
+            for m in deno_matches:
+                diagnostics.append({
+                    "file": m[2],
+                    "line": int(m[3]),
+                    "col": int(m[4]),
+                    "code": m[0],
+                    "severity": "error",
+                    "message": m[1].strip(),
+                })
+
+            # Match Node V8 errors & test AssertionError
+            v8_matches = re.findall(
+                r'([^\s:\n]+\.(?:mjs|cjs|ts|js)):(\d+)(?::(\d+))?\n[\s\S]{0,300}?(SyntaxError|TypeError|RangeError|ReferenceError|AssertionError|Error):\s+([^\n]+)',
+                logs,
+            )
+            for m in v8_matches:
+                sev = "test_failure" if m[3] == "AssertionError" else "error"
+                diagnostics.append({
+                    "file": m[0],
+                    "line": int(m[1]),
+                    "col": int(m[2]) if m[2] else 1,
+                    "severity": sev,
+                    "message": f"{m[3]}: {m[4]}",
+                })
+
+            if not diagnostics and "AssertionError" in logs:
+                for line in logs.splitlines():
+                    if "AssertionError" in line or "not ok " in line:
+                        diagnostics.append({
+                            "severity": "test_failure",
+                            "message": line.strip(),
+                        })
 
         return diagnostics
 

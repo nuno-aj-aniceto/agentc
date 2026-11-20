@@ -1,0 +1,129 @@
+module Examples.RateLimiter;
+
+target node {
+    variant: ts;
+    strict: true;
+    runtime: "node22";
+    package: "@examples/rate-limiter";
+}
+
+target cpp {
+    toolchain: make;
+    standard: "c++20";
+    namespace: "examples::ratelimit";
+}
+
+target java {
+    toolchain: maven;
+    jdk: 21;
+    package: "com.examples.ratelimit";
+}
+
+artifact prd "PRD-RL-001" {
+    feature: "Deterministic Circuit Breaker & Quota Rate Limiter";
+    acceptance: "Circuit transitions strictly follow Closed -> Open -> HalfOpen -> Closed; quotas decrement atomically";
+    constraints: [
+        "Remaining quota after consumption must equal old(remainingQuota) - cost",
+        "Circuit trips open at or above 1000ms latency budget",
+        "Window checks enforce < 1000ms latency and <= 64KB payload ceiling"
+    ];
+}
+
+artifact adr "ADR-0091" {
+    title: "Native Erasable TypeScript & Polyglot Contract Parity";
+    status: "Accepted";
+    latency_budget: "< 1000ms";
+    memory_limit: "< 64KB";
+}
+
+contract RateLimiter {
+    traces: [PRD-RL-001, ADR-0091];
+
+    enum CircuitState {
+        Closed,
+        Open,
+        HalfOpen
+    };
+
+    struct QuotaSnapshot {
+        clientId: string;
+        remaining: u32;
+        state: CircuitState;
+    };
+
+    state machine CircuitBreaker {
+        initial: Closed;
+        transitions: [
+            Closed -> Open,
+            Open -> HalfOpen,
+            HalfOpen -> Closed
+        ];
+    }
+
+    fn consumeQuota(clientId: string, remainingQuota: u32, cost: u32) -> u32 {
+        traces: [PRD-RL-001.QUOTA];
+        pre: clientId.len() > 0;
+        pre: remainingQuota >= cost;
+        post: result == old(remainingQuota) - cost;
+        post: result >= 0;
+    }
+
+    fn tripCircuit(latencyMs: u64) -> bool {
+        traces: [PRD-RL-001.TRIP, ADR-0091.LATENCY];
+        transition: Closed -> Open;
+        pre: latencyMs >= 1000ms;
+        post: result == true;
+    }
+
+    fn probeRecovery(retryWindowMs: u64) -> bool {
+        traces: [PRD-RL-001.RECOVERY];
+        transition: Open -> HalfOpen;
+        pre: retryWindowMs >= 500ms;
+        post: result == true;
+    }
+
+    fn closeCircuit(healthyProbes: u32) -> bool {
+        traces: [PRD-RL-001.CLOSE];
+        transition: HalfOpen -> Closed;
+        pre: healthyProbes >= 1;
+        post: result == true;
+    }
+
+    fn checkWindowBudget(elapsedMs: u64, payloadBytes: u64) -> bool {
+        traces: [ADR-0091.WINDOW];
+        pre: elapsedMs < 1000ms;
+        pre: payloadBytes <= 64KB;
+        post: result == true;
+    }
+}
+
+agent implementation for RateLimiter {
+    intent: "Implement deterministic rate-limiting and circuit-breaker transition guards targeting TypeScript/Node, C++20, and Java 21.";
+
+    invariants: [
+        "Consume quota strictly subtracts cost from pre-call remainingQuota snapshot",
+        "Circuit breaker state machine enforces Closed -> Open -> HalfOpen -> Closed",
+        "Window checks enforce sub-1000ms and 64KB upper limits"
+    ];
+
+    harness: tdd {
+        coverage_minimum: "90%";
+        property_tests: "true";
+    };
+}
+
+lifecycle sdlc {
+    verify: [unit_tests, type_check];
+    benchmark: {
+        latency_p99: "< 5ms";
+    };
+    package: docker {
+        base: "alpine";
+        tag: "1.0.0";
+    };
+    deploy: k8s {
+        namespace: "ratelimit";
+        replicas: "2";
+        port: "8080";
+    };
+}

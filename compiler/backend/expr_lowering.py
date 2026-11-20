@@ -6,6 +6,7 @@ Lowers typed Expr AST into idiomatic, semantically correct C++20 and Java 21 exp
 """
 
 from typing import Dict, Any, Optional
+from compiler.backend.node_emitter import NODE_TARGETS
 
 class ExprLowerer:
     @staticmethod
@@ -64,12 +65,20 @@ class ExprLowerer:
             elif unit == "B":
                 return val
             elif unit == "KB":
+                if self.target in NODE_TARGETS:
+                    return f"({val} * 1024)"
                 return f"({val} * 1024L)" if self.target == "java" else f"({val} * 1024ULL)"
             elif unit == "MB":
+                if self.target in NODE_TARGETS:
+                    return f"({val} * 1024 * 1024)"
                 return f"({val} * 1024L * 1024L)" if self.target == "java" else f"({val} * 1024 * 1024ULL)"
             elif unit == "GB":
+                if self.target in NODE_TARGETS:
+                    return f"({val} * 1024 * 1024 * 1024)"
                 return f"({val} * 1024L * 1024L * 1024L)" if self.target == "java" else f"({val} * 1024 * 1024 * 1024ULL)"
             elif unit == "TB":
+                if self.target in NODE_TARGETS:
+                    return f"({val} * 1024 * 1024 * 1024 * 1024)"
                 return f"({val} * 1024L * 1024L * 1024L * 1024L)" if self.target == "java" else f"({val} * 1024ULL * 1024 * 1024 * 1024)"
             return val
 
@@ -101,6 +110,8 @@ class ExprLowerer:
                 obj = self._lower_node(callee_node.get("args", [{}])[0])
                 mem_name = callee_node.get("value", "")
                 if mem_name == "len":
+                    if self.target in NODE_TARGETS:
+                        return f"{obj}.length"
                     return f"{obj}.length()"
                 # general member call
                 passed_args = [self._lower_node(a) for a in args[1:]]
@@ -113,7 +124,7 @@ class ExprLowerer:
                     return f"std::{callee_val}({', '.join(passed_args)})"
                 else:
                     if callee_val == "clamp":
-                        # Java clamp: Math.max(min, Math.min(max, val))
+                        # Java / Node clamp: Math.max(min, Math.min(max, val))
                         if len(passed_args) == 3:
                             v, mi, ma = passed_args[0], passed_args[1], passed_args[2]
                             return f"Math.max({mi}, Math.min({ma}, {v}))"
@@ -140,6 +151,9 @@ class ExprLowerer:
 
             # 3. Equality operators
             if op in ("==", "!="):
+                if self.target in NODE_TARGETS:
+                    strict_op = "===" if op == "==" else "!=="
+                    return f"({left} {strict_op} {right})"
                 is_string_comparison = self._is_string_expr(args[0]) or self._is_string_expr(args[1])
                 if is_string_comparison and self.target == "java":
                     if op == "==":

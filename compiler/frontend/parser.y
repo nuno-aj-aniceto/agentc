@@ -240,6 +240,8 @@ option_value:
     | NUMBER_LITERAL { $$ = $1; }
     | TIME_LITERAL { $$ = $1; }
     | BYTES_LITERAL { $$ = $1; }
+    | TRUE_KW { $$ = new std::string("true"); }
+    | FALSE_KW { $$ = new std::string("false"); }
     ;
 
 /* Contract declaration */

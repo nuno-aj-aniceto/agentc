@@ -12,6 +12,12 @@ target java {
     package: "com.examples.order";
 }
 
+target node {
+    variant: ts;
+    strict: true;
+    package: "@examples/order";
+}
+
 artifact prd "PRD-ORD-001" {
     feature: "Stateful Order Lifecycle & Timeout Controls";
     acceptance: "Orders must follow state machine Created -> Processing -> Fulfilled";

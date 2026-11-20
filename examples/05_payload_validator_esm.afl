@@ -1,0 +1,78 @@
+module Examples.PayloadGuard;
+
+target node {
+    variant: esm;
+    package: "@examples/payload-guard";
+}
+
+target cpp {
+    toolchain: make;
+    standard: "c++20";
+    namespace: "examples::payload";
+}
+
+target java {
+    toolchain: maven;
+    jdk: 21;
+    package: "com.examples.payload";
+}
+
+artifact prd "PRD-PG-001" {
+    feature: "Zero-Dependency ECMAScript & Polyglot Payload Validation";
+    acceptance: "Enforces payload byte limits, implication auth guards, and batch clamping cleanly in ESM/CJS/TS";
+    constraints: [
+        "Payloads above 64KB require authenticated == true",
+        "Maximum payload size bounded at 1MB"
+    ];
+}
+
+artifact adr "ADR-0092" {
+    title: "Strict Equality and Length Lowering Across JS/ESM/CJS and Native Toolchains";
+    status: "Accepted";
+    memory_limit: "< 1MB";
+}
+
+contract PayloadGuard {
+    traces: [PRD-PG-001, ADR-0092];
+
+    fn acceptPayload(contentType: string, sizeBytes: u64, authenticated: bool) -> bool {
+        traces: [PRD-PG-001.ACCEPT];
+        pre: contentType.len() > 0;
+        pre: sizeBytes <= 1MB;
+        pre: (sizeBytes > 64KB) implies authenticated;
+        post: result == true;
+    }
+
+    fn clampBatchSize(requested: i64, minBatch: i64, maxBatch: i64) -> i64 {
+        traces: [PRD-PG-001.CLAMP];
+        pre: minBatch >= 1 and minBatch <= maxBatch;
+        post: result == clamp(requested, minBatch, maxBatch);
+    }
+
+    fn isJsonContent(contentType: string) -> bool {
+        traces: [ADR-0092.STRICT_EQ];
+        pre: contentType.len() > 0;
+        post: result == (contentType == "application/json");
+    }
+}
+
+agent implementation for PayloadGuard {
+    intent: "Validate HTTP/RPC payload metadata, implication-guarded auth checks, and bounded batch sizes for Node ESM/CJS, C++20, and Java 21.";
+
+    invariants: [
+        "Unauthenticated payloads exceeding 64KB are rejected immediately",
+        "Strict string equality semantics preserve exact content-type matching"
+    ];
+
+    harness: tdd {
+        coverage_minimum: "90%";
+    };
+}
+
+lifecycle sdlc {
+    verify: [unit_tests, ecmascript_lint];
+    package: docker {
+        base: "alpine";
+        tag: "1.0.0";
+    };
+}

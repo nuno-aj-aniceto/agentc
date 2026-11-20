@@ -3,6 +3,7 @@
 [![Compiler](https://img.shields.io/badge/compiler-bison%203.8%20%7C%20flex%202.6-blue)](#)
 [![Standard](https://img.shields.io/badge/C%2B%2B-20%20%7C%2023-purple)](#)
 [![Java](https://img.shields.io/badge/Java-OpenJDK%2021%2B-red)](#)
+[![Node.js](https://img.shields.io/badge/Node.js-ESM%20%7C%20CJS%20%7C%20TS-brightgreen)](#)
 [![License](https://img.shields.io/badge/license-MIT-green)](#)
 
 `agentc` is a next-generation programming language and compiling toolchain engineered for the agentic development era. It shifts the paradigm of programming from mechanical, boilerplate-heavy syntax to **verified semantic contracts, architectural intents, and an autonomous compiler agent**.
@@ -22,7 +23,7 @@
    - **Semantic Intent Nodes**: High-level functionality is declared via `intent`, `invariants`, and `contract` pre/post-conditions, drastically reducing token generation overhead.
 4. **Polyglot Autonomous Compiling Agent**:
    - `agentc` comprehends the program's structural semantics and synthesizes idiomatic, production-grade target implementations.
-   - Supports polyglot toolchains: **modern C++20 via CMake/Make** and **Java 21+ via Maven/Javac**.
+   - Supports polyglot toolchains: **modern C++20 via CMake/Make**, **Java 21+ via Maven/Javac**, and **Node.js 22+ across ECMAScript Modules (`.mjs` + `.d.ts`), CommonJS (`.cjs` + `.d.ts`), and Native Erasable TypeScript (`.ts`)**.
 5. **Closed-Loop Verification & Self-Healing (TDD Loop)**:
    - When native compilers (`clang++`, `g++`, `javac`) report warnings or test assertions fail, `agentc` parses the diagnostics, cross-references active PRD/ADR bounds, and iteratively refines the implementation until all quality gates pass.
 6. **Incremental Merkle AST Caching**:
@@ -59,11 +60,12 @@ agentc/
 │   │   ├── agent_synthesizer.py  # Agentic synthesis core (postconditions & CLI harnesses)
 │   │   └── cache_manager.py      # Merkle AST caching engine (intent, target, artifact aware)
 │   ├── backend/
-│   │   ├── expr_lowering.py      # Target-aware lowering (implies, string equality, clamp)
+│   │   ├── expr_lowering.py      # Target-aware lowering (implies, string equality, clamp, length)
 │   │   ├── cpp_emitter.py        # C++20, CMakeLists.txt & standalone Makefile generator
 │   │   ├── java_emitter.py       # Java 21, standalone Makefile & Maven pom.xml generator
+│   │   ├── node_emitter.py       # Node.js package.json, tsconfig.json, .d.ts & Makefile generator
 │   │   ├── container_emitter.py  # OCI Containerfile & .containerignore generator
-│   │   └── toolchain_runner.py   # Subprocess runner for CMake, Make, Javac, Maven
+│   │   └── toolchain_runner.py   # Subprocess runner for CMake, Make, Javac, Maven & Node
 │   └── repair/
 │       └── auto_healer.py        # Closed-loop compiler diagnostic parser & repair loop
 ├── cli/
@@ -71,7 +73,9 @@ agentc/
 ├── examples/
 │   ├── 01_math_service.afl       # Arithmetic & statistics contract
 │   ├── 02_token_service.afl      # Cryptographic token store with structs & enums
-│   └── 03_order_service.afl      # Stateful order service (state machines, old(), units, traces)
+│   ├── 03_order_service.afl      # Stateful order service (state machines, old(), units, traces)
+│   ├── 04_rate_limiter_ts.afl    # Native TypeScript stateful circuit breaker & rate limiter
+│   └── 05_payload_validator_esm.afl # ECMAScript/CJS polyglot payload validator
 ├── tests/
 │   ├── test_build_systems.py     # Standalone Makefile and parser build tests
 │   ├── test_cache.py             # Invalidation and deterministic hit tests
@@ -80,8 +84,9 @@ agentc/
 │   ├── test_drex_engine.py       # ADR constraint evaluation and scoring benchmarks
 │   ├── test_grammar.py           # Parser grammar, operator precedence, and AST tests
 │   ├── test_lowering.py          # Target-aware expression lowering tests
+│   ├── test_node_support.py      # Wave 3 Node.js (TS/ESM/CJS), .d.ts & consumer code tests
 │   ├── test_parser.py            # Unit tests for Flex/Bison grammar
-│   ├── test_sema.py              # Semantic analyzer E001-E008 validation tests
+│   ├── test_sema.py              # Semantic analyzer E001-E012 validation tests
 │   └── test_wave2_features.py    # Wave 2 specifications (traces, state machine, old(), units)
 ├── CMakeLists.txt                # Native parser CMake configuration
 ├── Containerfile                 # Portable agentc toolchain container
@@ -228,32 +233,49 @@ agentc build examples/01_math_service.afl --target java
 ```
 *Emits Java 21 class, JUnit 5 test suite, CLI dispatcher harness, `pom.xml`, and standalone `Makefile`. Enforces pre/postconditions and unsigned `u32` range parity.*
 
-### 7. Package into OCI Container (Podman / Buildah)
+### 7. Compile for Node.js (TypeScript, ECMAScript ESM, CommonJS & `.d.ts` Bindings)
+```bash
+# Native Erasable TypeScript (.ts + tsconfig.json + node:test)
+agentc build examples/04_rate_limiter_ts.afl --target ts
+
+# Modern ES2024 ECMAScript Modules (.mjs + .d.ts TypeScript bindings)
+agentc build examples/05_payload_validator_esm.afl --target js
+
+# CommonJS (.cjs + .d.ts TypeScript bindings)
+agentc build examples/02_token_service.afl --target cjs
+
+# Resolve variant from `target node { variant: ...; }` in the .afl source
+agentc build examples/03_order_service.afl --target node
+```
+*Emits standard `package.json`, `tsconfig.json` (for TS), `.d.ts` bindings (for ESM/CJS), standalone `Makefile`, `node:test` verification suite, and JSON CLI harness.*
+
+### 8. Package into OCI Container (Podman / Buildah)
 Generate a multi-stage, libc-paired (Alpine or Distroless), non-root OCI `Containerfile` and build an image:
 ```bash
 # Package with Podman/Buildah (builds and tags localhost/<image>:<tag>)
 agentc package examples/01_math_service.afl --target cpp --engine podman
+agentc package examples/04_rate_limiter_ts.afl --target ts --emit-only
 
 # Emit Containerfile and .containerignore without invoking container runtime:
 agentc package examples/01_math_service.afl --target cpp --emit-only
 ```
 
-### 8. Run Contract Functions Directly (Host or Container)
+### 9. Run Contract Functions Directly (Host or Container)
 Directly invoke contract methods via the generated CLI dispatcher or run selftest:
 ```bash
 # Run a specific contract function:
 agentc run examples/01_math_service.afl --target cpp -- divide 10 2
-# Output: {"result": 5}
+agentc run examples/04_rate_limiter_ts.afl --target ts -- consumeQuota clientA 100 25
+# Output: {"result": 75}
 
 # Run selftest:
-agentc run examples/01_math_service.afl --target cpp -- selftest
-# Output: MathOperations selftest passed: all 4 operations verified
+agentc run examples/01_math_service.afl --target js -- selftest
 
 # Run inside the containerized image:
 agentc run examples/01_math_service.afl --target cpp --container -- divide 10 2
 ```
 
-### 9. Run Comprehensive Test Suite
+### 10. Run Comprehensive Test Suite
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
@@ -266,6 +288,7 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 |:---|:---|:---|:---|:---|
 | **C++20** | `gcc` / `clang++` C++20 | CMake 3.20+ & Standalone Make | Full pre/postcondition enforcement, CLI selftest | ~3.1s (fresh) / ~0.003s (AST cache) |
 | **Java 21** | OpenJDK 21 / 26 | Standalone Make & Maven | Full pre/postcondition enforcement, CLI selftest | ~0.8s (fresh) / ~0.002s (AST cache) |
+| **Node.js (TS/ESM/CJS)** | Node `v22.6+` / `v26` + Deno/TSC | Standalone Make & `package.json` | Native TS, ESM/CJS + `.d.ts`, `node:test`, consumer code | ~0.8s (TS) / ~2.6s (ESM/CJS) |
 | **Parser** | Bison 3.8 / Flex 2.6 | Dual: GNU Make & CMake | 100% deterministic, 0 conflicts, typed Expr AST | < 3ms |
 | **Containers**| OCI / Multi-stage | Podman 6.2+ & Buildah 1.46+ | Distroless & Alpine, non-root, lineage labels | Verified via `podman run` |
-| **Quality Gates**| Python 3.12+ Unit Tests | `unittest` test runner | 62/62 tests passing (100%) | ~120s full suite |
+| **Quality Gates**| Python 3.12+ Unit Tests | `unittest` test runner | 74/74 tests passing (100%) | ~65s full suite |
